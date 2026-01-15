@@ -37,7 +37,7 @@ st.sidebar.download_button(
 upload_file = st.sidebar.file_uploader("Upload CSV/XLSX (Histórico)", type=["csv", "xlsx"])
 
 # -----------------------------------
-# CARREGAMENTO E PROCESSAMENTO DE DADOS
+# CARREGAMENTO E PROCESSAMENTO DOS DADOS
 # -----------------------------------
 if upload_file:
     df_hist = pd.read_csv(upload_file) if upload_file.name.endswith(".csv") else pd.read_excel(upload_file)
@@ -50,54 +50,55 @@ if upload_file:
 
     st.success("Dados históricos carregados com sucesso!")
 
-    # Linha 0 = mais recente
+    # ---- NENHUMA INVERSÃO: assumimos que a linha 0 já é o dia mais recente ----
     df_hist["Fluxo_Liquido"] = df_hist["Aportes_do_Dia"] - df_hist["Resgates_Brutos"]
     df_hist["Fluxo_Risco"] = df_hist["Fluxo_Liquido"].apply(lambda x: abs(x) if x < 0 else 0)
 
-    # Demanda base conservadora (último EWMA + 2.33*STD)
-    span = janela_hist
-    df_hist["EWMA"] = df_hist["Fluxo_Risco"].ewm(span=span).mean()
-    df_hist["STD"] = df_hist["Fluxo_Risco"].ewm(span=span).std().fillna(0)
-    demanda_base_conservadora = df_hist["EWMA"].iloc[0] + 2.33 * df_hist["STD"].iloc[0]
-
+    # O PL mais recente está na linha 0
     pl_total = df_hist["Patrimonio_Liquido"].iloc[0]
+
 else:
     st.warning("⚠️ Sem histórico carregado — valores simulados serão usados.")
-    df_hist = None
     pl_total = st.sidebar.number_input("PL (R$) para simulação", value=10000000.0)
-    demanda_base_conservadora = 0.0
+    df_hist = None
 
 # -----------------------------------
-# FUNÇÃO DEMANDA ESTRESSADA EMPÍRICA
+# DEMANDA ESTRESSADA (COM JANELA HISTÓRICA)
 # -----------------------------------
-def demanda_estressada_empirica(historico, window_length):
+def demanda_estressada(historico, window_length):
+    """
+    Para um horizonte window_length (dias),
+    calcula o percentil 99 da soma de resgates negativos acumulados
+    em janelas de comprimento = window_length,
+    assumindo que a linha 0 é o mais recente.
+    """
     if historico is None or len(historico) < window_length:
         return 0.0
+
     risco = historico["Fluxo_Risco"].values
     rolling_sums = []
     for start in range(0, len(risco) - window_length + 1):
         window_sum = risco[start : start + window_length].sum()
         rolling_sums.append(window_sum)
+
     if len(rolling_sums) == 0:
         return 0.0
+
     return float(np.percentile(rolling_sums, 99))
 
 # -----------------------------------
-# VÉRTICES
+# VÉRTICES PARA CÁLCULO
 # -----------------------------------
 vertices = sorted(list({1, 5, 21, 42, 63, prazo_resgate_fof}))
 
+# Agora, em vez de usar "v" como tamanho
+# usamos sempre "janela_hist" para toda demanda estressada
 demanda_por_vertice = {}
 for v in vertices:
-    # Empírico
-    dem_emp = demanda_estressada_empirica(df_hist, v)
-    # Conservador escalado por sqrt(v)
-    dem_cons = (demanda_base_conservadora * np.sqrt(v)) if demanda_base_conservadora > 0 else 0.0
-    # **Demanda final = maior entre empírico e conservador**
-    demanda_por_vertice[v] = max(dem_emp, dem_cons)
+    demanda_por_vertice[v] = demanda_estressada(df_hist, janela_hist)
 
 # -----------------------------------
-# CARTEIRA DE FUNDOS
+# CARTEIRA DE FUNDOS INVESTIDOS
 # -----------------------------------
 st.header("📋 Carteira de Fundos Investidos")
 
@@ -118,7 +119,7 @@ for i in range(st.session_state.n_ativos):
 df_carteira = pd.DataFrame(ativos)
 
 # -----------------------------------
-# CÁLCULO DO IL
+# CÁLCULO DO ÍNDICE DE LIQUIDEZ (IL)
 # -----------------------------------
 resultados = []
 for v in vertices:
@@ -128,14 +129,14 @@ for v in vertices:
     resultados.append({
         "Vértice": f"D+{v}",
         "Oferta": oferta,
-        "Demanda Estressada": demanda_v,
+        "DemandaEstressada": demanda_v,
         "IL": il_v
     })
 
 df_il = pd.DataFrame(resultados)
 
 # -----------------------------------
-# KPIs
+# KPIs PRINCIPAIS
 # -----------------------------------
 il_fof = df_il[df_il["Vértice"] == f"D+{prazo_resgate_fof}"]["IL"].values[0]
 mismatch_val = df_carteira[df_carteira["Prazo"] > prazo_resgate_fof]["Valor"].sum()
@@ -147,17 +148,17 @@ k2.metric("Mismatch (> prazo FoF %)", f"{mismatch_perc:.1f}%")
 k3.metric("PL Total (R$)", f"{pl_total:,.2f}")
 
 # -----------------------------------
-# GRÁFICO
+# GRÁFICO: OFERTA VS DEMANDA
 # -----------------------------------
 fig = go.Figure()
 fig.add_trace(go.Bar(x=df_il["Vértice"], y=df_il["Oferta"], name="Oferta Acumulada", marker_color="#00CC96"))
-fig.add_trace(go.Scatter(x=df_il["Vértice"], y=df_il["Demanda Estressada"],
+fig.add_trace(go.Scatter(x=df_il["Vértice"], y=df_il["DemandaEstressada"],
                          name="Demanda Estressada", line=dict(color="red", width=3)))
 fig.update_layout(title="Cobertura de Liquidez por Vértice", barmode="group", hovermode="x unified")
 st.plotly_chart(fig)
 
 # -----------------------------------
-# ALERTAS
+# ALERTAS (COM BASE NOS LIMITES)
 # -----------------------------------
 if not np.isnan(il_fof):
     if il_fof < 1:
