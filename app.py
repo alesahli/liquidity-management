@@ -5,125 +5,124 @@ import plotly.graph_objects as go
 from io import BytesIO
 
 # Configuração da Página
-st.set_page_config(page_title="Gestão de Liquidez FoF - CVM 175", layout="wide")
+st.set_page_config(page_title="Risco de Liquidez FoF", layout="wide")
 
-# --- TÍTULO E SIDEBAR ---
-st.title("📊 Gestão de Risco de Liquidez (FoF)")
-st.sidebar.header("Configurações do Fundo")
-
-# Inputs do Usuário
-prazo_resgate_fof = st.sidebar.number_input("Prazo de Resgate do FoF (D+X)", min_value=0, value=7, step=1)
-janela_ewma = st.sidebar.slider("Janela Histórica EWMA (Meses)", 1, 36, 12)
-upload_file = st.sidebar.file_uploader("Upload de Histórico (Excel ou CSV)", type=['csv', 'xlsx'])
-
-# --- FUNÇÕES DE CÁLCULO ---
-def calcular_ewma(serie, span):
-    return serie.ewm(span=span, adjust=False).mean()
-
-def processar_dados(df, janela):
-    df['Data'] = pd.to_datetime(df['Data'])
-    df = df.sort_values('Data')
-    
-    # Captação Líquida e Regra ANBIMA (Min de 0 e Captação Líquida Negativa)
-    df['Captacao_Liquida'] = df['Aportes_Agendados'] - df['Resgates_Brutos']
-    df['Fluxo_Risco'] = df['Captacao_Liquida'].apply(lambda x: abs(x) if x < 0 else 0)
-    
-    # EWMA e Desvio Padrão para Estresse (99% de confiança = 2.33 DP)
-    span_dias = janela * 21
-    df['EWMA_Resgates'] = df['Fluxo_Risco'].ewm(span=span_dias).mean()
-    df['Std_Resgates'] = df['Fluxo_Risco'].ewm(span=span_dias).std()
-    df['Demanda_Estresse'] = df['EWMA_Resgates'] + (2.33 * df['Std_Resgates'])
-    
-    return df
-
-# --- INTERFACE PRINCIPAL ---
-if upload_file:
-    if upload_file.name.endswith('.csv'):
-        df_historico = pd.read_csv(upload_file)
-    else:
-        df_historico = pd.read_excel(upload_file)
-    
-    df_processado = processar_dados(df_historico, janela_ewma)
-    ultimo_pl = df_processado['Patrimonio_Liquido'].iloc[-1]
-    demanda_base = df_processado['Demanda_Estresse'].iloc[-1]
-
-    # --- CADASTRO DE CARTEIRA (ATIVOS) ---
-    st.subheader("📋 Carteira de Ativos Investidos")
-    st.write("Insira os prazos de resgate dos fundos na sua carteira:")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        n_ativos = st.number_input("Quantidade de Ativos na Carteira", min_value=1, value=3)
-    
-    ativos_data = []
-    for i in range(int(n_ativos)):
-        c1, c2, c3 = st.columns([3, 2, 2])
-        nome = c1.text_input(f"Nome do Ativo {i+1}", f"Fundo {i+1}")
-        prazo = c2.number_input(f"Prazo (D+P) Ativo {i+1}", min_value=0, value=0, key=f"p{i}")
-        valor = c3.number_input(f"Valor Alocado (R$)", min_value=0.0, value=ultimo_pl/n_ativos, key=f"v{i}")
-        ativos_data.append({"Ativo": nome, "Prazo": prazo, "Valor": valor})
-    
-    df_carteira = pd.DataFrame(ativos_data)
-    
-    # --- LÓGICA DE VÉRTICES ---
-    vertices = sorted(list(set([1, 5, 21, 42, 63, prazo_resgate_fof])))
-    resultados = []
-
-    for v in vertices:
-        # Oferta: Soma ativos onde Prazo <= Vértice
-        oferta = df_carteira[df_carteira['Prazo'] <= v]['Valor'].sum()
-        # Demanda: Projetada para o vértice (simplificação linear do estresse diário)
-        demanda_v = demanda_base * np.sqrt(v) # Raiz de T para escala de tempo de risco
-        
-        il = oferta / demanda_v if demanda_v > 0 else 0
-        resultados.append({"Vértice": f"D+{v}", "Prazo_Num": v, "Oferta": oferta, "Demanda": demanda_v, "IL": il})
-
-    df_il = pd.DataFrame(resultados)
-
-    # --- DASHBOARD ---
-    st.divider()
-    
-    # KPIs principais
-    il_critico = df_il[df_il['Prazo_Num'] == prazo_resgate_fof]['IL'].values[0]
-    mismatch_ativos = df_carteira[df_carteira['Prazo'] > prazo_resgate_fof]['Valor'].sum()
-    perc_mismatch = (mismatch_ativos / ultimo_pl) * 100
-
-    k1, k2, k3 = st.columns(3)
-    k1.metric(f"IL no Vértice Alvo (D+{prazo_resgate_fof})", f"{il_critico:.2f}")
-    k2.metric("Total Mismatch (Ativos > D+X)", f"R$ {mismatch_ativos:,.2/}", f"{perc_mismatch:.2f}%", delta_color="inverse")
-    k3.metric("PL Total do Fundo", f"R$ {ultimo_pl:,.2f}")
-
-    # Gráfico
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=df_il['Vértice'], y=df_il['Oferata'], name='Oferta de Liquidez (Ativo)', marker_color='royalblue'))
-    fig.add_trace(go.Scatter(x=df_il['Vértice'], y=df_il['Demanda'], name='Demanda Estressada (Passivo)', line=dict(color='red', width=3)))
-    fig.update_layout(title="Oferta vs Demanda Acumulada por Vértice", barmode='group')
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Alertas de Conformidade
-    st.subheader("⚠️ Verificação de Conformidade")
-    if il_critico < 1.0:
-        st.error(f"ALERTA VERMELHO: Índice de Liquidez abaixo de 1.0 no prazo D+{prazo_resgate_fof}.")
-    elif il_critico < 1.2:
-        st.warning(f"ALERTA AMARELO: Soft Limit atingido. IL próximo ao limite prudencial.")
-    else:
-        st.success("SITUAÇÃO CONFORTÁVEL: IL acima de 1.2.")
-
-    if perc_mismatch > 25:
-        st.error(f"DESENQUADRAMENTO: Mismatch de {perc_mismatch:.2f}% excede o limite de 25% do PL.")
-    
-    fundos_longos = df_carteira[df_carteira['Prazo'] > 30]['Ativo'].tolist()
-    if fundos_longos:
-        st.info(f"OBSERVAÇÃO: Existem ativos com prazo superior a D+30: {', '.join(fundos_longos)}")
-
-    # Exportação
+# --- FUNÇÃO PARA CRIAR TEMPLATE ---
+def gerar_template():
+    df = pd.DataFrame({
+        'Data': pd.date_range(start='2023-01-01', periods=5),
+        'Resgates_Brutos': [100000, 0, 500000, 150000, 200000],
+        'Aportes_do_Dia': [50000, 200000, 0, 100000, 50000],
+        'Patrimonio_Liquido': [10000000, 10150000, 9650000, 9600000, 9450000]
+    })
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_il.to_excel(writer, index=False, sheet_name='Indices_Liquidez')
-        df_carteira.to_excel(writer, index=False, sheet_name='Carteira')
-    st.download_button("📥 Exportar Relatório para Excel", data=output.getvalue(), file_name="relatorio_liquidez.xlsx")
+        df.to_excel(writer, index=False)
+    return output.getvalue()
 
+# --- SIDEBAR ---
+st.sidebar.header("1. Configurações e Dados")
+prazo_resgate_fof = st.sidebar.number_input("Prazo de Resgate do FoF (D+X)", min_value=0, value=7)
+janela_ewma = st.sidebar.slider("Janela EWMA (Meses)", 1, 36, 12)
+
+st.sidebar.subheader("Download de Modelo")
+st.sidebar.download_button(
+    label="📥 Baixar Planilha Modelo (Excel)",
+    data=gerar_template(),
+    file_name="modelo_dados_liquidez.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+upload_file = st.sidebar.file_uploader("Upload do Histórico", type=['csv', 'xlsx'])
+
+# --- LOGICA DE PL E DEMANDA ---
+pl_manual = 0.0
+demanda_base = 0.0
+
+if upload_file:
+    df_hist = pd.read_csv(upload_file) if upload_file.name.endswith('.csv') else pd.read_excel(upload_file)
+    # Ajuste de nomes de colunas para flexibilidade
+    df_hist.columns = [c.strip() for c in df_hist.columns]
+    
+    df_hist['Data'] = pd.to_datetime(df_hist['Data'])
+    df_hist = df_hist.sort_values('Data')
+    
+    # Cálculo de Fluxo (Regra ANBIMA)
+    df_hist['Fluxo_Liquido'] = df_hist['Aportes_do_Dia'] - df_hist['Resgates_Brutos']
+    df_hist['Fluxo_Risco'] = df_hist['Fluxo_Liquido'].apply(lambda x: abs(x) if x < 0 else 0)
+    
+    span = janela_ewma * 21
+    df_hist['EWMA'] = df_hist['Fluxo_Risco'].ewm(span=span).mean()
+    df_hist['STD'] = df_hist['Fluxo_Risco'].ewm(span=span).std()
+    
+    pl_manual = df_hist['Patrimonio_Liquido'].iloc[-1]
+    demanda_base = df_hist['EWMA'].iloc[-1] + (2.33 * df_hist['STD'].fillna(0).iloc[-1])
+    st.success(f"Dados carregados! PL Atual: R$ {pl_manual:,.2f}")
 else:
-    st.info("Aguardando upload de arquivo para processar cálculos...")
-    # Exemplo de como deve ser o arquivo
-    st.write("O arquivo deve conter as colunas: `Data`, `Resgates_Brutos`, `Aportes_Agendados`, `Patrimonio_Liquido`")
+    st.warning("⚠️ Sem histórico. Insira o PL e a Demanda estimada para simular:")
+    c1, c2 = st.columns(2)
+    pl_manual = c1.number_input("Patrimonio Líquido (PL) para simulação", min_value=0.0, value=10000000.0)
+    demanda_base = c2.number_input("Demanda de Resgate Estimada (D+1)", min_value=0.0, value=pl_manual*0.02)
+
+# --- SEÇÃO DA CARTEIRA ---
+st.divider()
+st.header("📋 2. Carteira de Ativos Investidos")
+st.info("Cadastre os fundos onde o FoF investe para calcular a oferta de liquidez.")
+
+if "n_ativos" not in st.session_state:
+    st.session_state.n_ativos = 3
+
+col_n1, col_n2 = st.columns([1, 5])
+if col_n1.button("➕ Adicionar Ativo"):
+    st.session_state.n_ativos += 1
+
+ativos_data = []
+for i in range(st.session_state.n_ativos):
+    c1, c2, c3 = st.columns([3, 2, 2])
+    nome = c1.text_input(f"Ativo {i+1}", f"Fundo Investido {i+1}", key=f"n{i}")
+    prazo = c2.number_input(f"Prazo (D+P)", min_value=0, value=0, key=f"p{i}")
+    valor = c3.number_input(f"Valor (R$)", min_value=0.0, value=pl_manual/st.session_state.n_ativos, key=f"v{i}")
+    ativos_data.append({"Ativo": nome, "Prazo": prazo, "Valor": valor})
+
+df_carteira = pd.DataFrame(ativos_data)
+
+# --- CÁLCULOS FINAIS ---
+st.divider()
+st.header("📊 3. Análise de Risco e IL")
+
+vertices = sorted(list(set([1, 5, 21, 42, 63, prazo_resgate_fof])))
+res_list = []
+
+for v in vertices:
+    oferta = df_carteira[df_carteira['Prazo'] <= v]['Valor'].sum()
+    # Escala de tempo raiz de T para demanda
+    demanda_v = demanda_base * np.sqrt(v)
+    il = oferta / demanda_v if demanda_v > 0 else 0
+    res_list.append({"Vértice": f"D+{v}", "Prazo_Num": v, "Oferta": oferta, "Demanda": demanda_v, "IL": il})
+
+df_il = pd.DataFrame(res_list)
+
+# KPIs
+il_alvo = df_il[df_il['Prazo_Num'] == prazo_resgate_fof]['IL'].values[0]
+mismatch_r = df_carteira[df_carteira['Prazo'] > prazo_resgate_fof]['Valor'].sum()
+perc_mismatch = (mismatch_r / pl_manual) * 100 if pl_manual > 0 else 0
+
+k1, k2, k3 = st.columns(3)
+k1.metric(f"IL no Prazo do FoF (D+{prazo_resgate_fof})", f"{il_alvo:.2f}")
+k2.metric("Mismatch (Ativos > Prazo FoF)", f"{perc_mismatch:.1f}%", f"R$ {mismatch_r:,.2f}", delta_color="inverse")
+k3.metric("PL Total", f"R$ {pl_manual:,.2f}")
+
+# Gráfico
+fig = go.Figure()
+fig.add_trace(go.Bar(x=df_il['Vértice'], y=df_il['Oferta'], name='Oferta Acumulada', marker_color='#00CC96'))
+fig.add_trace(go.Scatter(x=df_il['Vértice'], y=df_il['Demanda'], name='Demanda Estresse', line=dict(color='#EF553B', width=4)))
+fig.update_layout(title="Cobertura de Liquidez por Vértice", barmode='group', hovermode="x unified")
+st.plotly_chart(fig, use_container_width=True)
+
+# Alertas
+if il_alvo < 1.0:
+    st.error(f"🚨 DESENQUADRAMENTO: O fundo não possui ativos líquidos suficientes para honrar o estresse em D+{prazo_resgate_fof}")
+elif il_alvo < 1.3:
+    st.warning("⚠️ ATENÇÃO: Índice de liquidez em nível de alerta (Soft Limit).")
+else:
+    st.success("✅ CONFORMIDADE: Os níveis de liquidez estão confortáveis.")
