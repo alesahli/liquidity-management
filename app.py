@@ -25,7 +25,7 @@ st.set_page_config(page_title="Risco de Liquidez FoF", layout="wide")
 
 st.sidebar.header("Configurações de Liquidez")
 prazo_resgate_fof = st.sidebar.number_input("Prazo de Resgate do FoF (D+X)", min_value=1, value=7)
-janela_hist = st.sidebar.slider("Janela Histórica (dias)", min_value=21, max_value=252, value=60, step=1)
+janela_hist = st.sidebar.slider("Janela Histórica (dias para stress)", min_value=21, max_value=252, value=60, step=1)
 
 st.sidebar.download_button(
     "📥 Baixar Modelo de Planilha (Excel)",
@@ -34,57 +34,63 @@ st.sidebar.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-upload_file = st.sidebar.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx"])
+upload_file = st.sidebar.file_uploader("Upload CSV/XLSX (Histórico)", type=["csv", "xlsx"])
 
 # -----------------------------------
-# CARREGAMENTO DE DADOS
+# CARREGAMENTO E PROCESSAMENTO DOS DADOS
 # -----------------------------------
 if upload_file:
     df_hist = pd.read_csv(upload_file) if upload_file.name.endswith(".csv") else pd.read_excel(upload_file)
     df_hist.columns = [c.strip() for c in df_hist.columns]
-    
-    # ---- INVERTE A ORDEM: PRIMEIRA LINHA É O MAIS RECENTE ----
-    df_hist = df_hist.iloc[::-1].reset_index(drop=True)
-    
-    st.success("Dados históricos carregados com sucesso!")
-    
-    # Verificação de colunas obrigatórias
-    required = {"Resgates_Brutos", "Aportes_do_Dia", "Patrimonio_Liquido"}
-    if not required.issubset(set(df_hist.columns)):
+
+    required_cols = {"Resgates_Brutos", "Aportes_do_Dia", "Patrimonio_Liquido"}
+    if not required_cols.issubset(df_hist.columns):
         st.error("A planilha deve conter as colunas: Resgates_Brutos, Aportes_do_Dia e Patrimonio_Liquido")
         st.stop()
-    
-    # Cálculo de Fluxos
+
+    st.success("Dados carregados com sucesso!")
+
+    # Cálculo de fluxos
     df_hist["Fluxo_Liquido"] = df_hist["Aportes_do_Dia"] - df_hist["Resgates_Brutos"]
     df_hist["Fluxo_Risco"] = df_hist["Fluxo_Liquido"].apply(lambda x: abs(x) if x < 0 else 0)
-    
-    # O PL mais recente agora está no topo (linha 0)
+
+    # O PL mais recente agora está na linha 0
     pl_total = df_hist["Patrimonio_Liquido"].iloc[0]
+
 else:
-    st.warning("⚠️ Sem histórico carregado — valores simulados serão usados.")
+    st.warning("⚠️ Sem histórico carregado — dados simulados serão usados.")
     pl_total = st.sidebar.number_input("PL (R$) para simulação", value=10000000.0)
     df_hist = None
 
 # -----------------------------------
-# MÉTRICAS DE DEMANDA ESTRESSADA
+# FUNÇÃO DE DEMANDA ESTRESSADA (LINHA 0 COMO MAIS RECENTE)
 # -----------------------------------
 def demanda_estressada(historico, v):
     """
-    Para um horizonte v (em dias), calcula o percentil 99 da soma acumulada de resgates negativos
-    em janelas de tamanho v sobre o histórico.
+    Para um horizonte v em dias, calcula o percentil 99 da soma acumulada de resgates negativos
+    em janelas que começam na linha mais recente (índice 0) e vão para datas mais antigas.
     """
     if historico is None or len(historico) < v:
         return 0.0
-    rss = historico["Fluxo_Risco"].rolling(window=v).sum().dropna()
-    return np.percentile(rss, 99)
+
+    risco = historico["Fluxo_Risco"].values
+    rolling_sums = []
+    for start in range(0, len(risco) - v + 1):
+        window_sum = risco[start : start + v].sum()
+        rolling_sums.append(window_sum)
+
+    if len(rolling_sums) == 0:
+        return 0.0
+    return float(np.percentile(rolling_sums, 99))
 
 vertices = sorted(list({1, 5, 21, 42, 63, prazo_resgate_fof}))
 demanda_por_vertice = {v: demanda_estressada(df_hist, v) for v in vertices}
 
 # -----------------------------------
-# SEÇÃO DE CARTEIRA (FUNDOS INVESTIDOS)
+# SEÇÃO DE CARTEIRA DE FUNDOS
 # -----------------------------------
 st.header("📋 Carteira de Fundos Investidos")
+
 if "n_ativos" not in st.session_state:
     st.session_state.n_ativos = 3
 
@@ -102,7 +108,7 @@ for i in range(st.session_state.n_ativos):
 df_carteira = pd.DataFrame(ativos)
 
 # -----------------------------------
-# CÁLCULO DO ÍNDICE DE LIQUIDEZ (IL) E OUTRAS MÉTRICAS
+# CÁLCULO DO ÍNDICE DE LIQUIDEZ (IL), DEMANDA E OFERTA
 # -----------------------------------
 resultados = []
 for v in vertices:
@@ -112,13 +118,15 @@ for v in vertices:
     resultados.append({
         "Vértice": f"D+{v}",
         "Oferta": oferta,
-        "DemandaEstressada": demanda_v,
+        "Demanda_Estressada": demanda_v,
         "IL": il_v
     })
 
 df_il = pd.DataFrame(resultados)
 
-# Principais KPIs
+# -----------------------------------
+# KPI PRINCIPAIS MÉTRICAS
+# -----------------------------------
 il_fof = df_il[df_il["Vértice"] == f"D+{prazo_resgate_fof}"]["IL"].values[0]
 mismatch_val = df_carteira[df_carteira["Prazo"] > prazo_resgate_fof]["Valor"].sum()
 mismatch_perc = (mismatch_val / pl_total * 100) if pl_total > 0 else 0
@@ -129,13 +137,15 @@ k2.metric("Mismatch (> prazo FoF %)", f"{mismatch_perc:.1f}%")
 k3.metric("PL Total (R$)", f"{pl_total:,.2f}")
 
 # -----------------------------------
-# GRÁFICO: OFERTA X DEMANDA
+# GRÁFICO: OFERTA VS. DEMANDA
 # -----------------------------------
 fig = go.Figure()
-fig.add_trace(go.Bar(x=df_il["Vértice"], y=df_il["Oferta"], name="Oferta Acumulada", marker_color="#00CC96"))
-fig.add_trace(go.Scatter(x=df_il["Vértice"], y=df_il["DemandaEstressada"],
+fig.add_trace(go.Bar(x=df_il["Vértice"], y=df_il["Oferta"],
+                     name="Oferta Acumulada", marker_color="#00CC96"))
+fig.add_trace(go.Scatter(x=df_il["Vértice"], y=df_il["Demanda_Estressada"],
                          name="Demanda Estressada", line=dict(color="red", width=3)))
-fig.update_layout(title="Cobertura de Liquidez por Vértice", barmode="group", hovermode="x unified")
+fig.update_layout(title="Cobertura de Liquidez por Vértice",
+                  barmode="group", hovermode="x unified")
 st.plotly_chart(fig)
 
 # -----------------------------------
@@ -151,4 +161,3 @@ if not np.isnan(il_fof):
 
 if mismatch_perc > 25:
     st.warning("⚠️ Mismatch > 25% do PL — revisar carteira.")
-
